@@ -1,0 +1,71 @@
+{
+  "name": "@linuxctrl/spyglass",
+  "version": "0.1.0",
+  "description": "Dependency graph visualizer for monorepos and JS/TS projects",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "spyglass": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run build:lib && bun run build:cli && bun run build:types",
+    "build:lib": "bun build src/index.ts --outfile dist/index.js --target node --format esm && bun build src/index.ts --outfile dist/index.cjs --target node --format cjs",
+    "build:cli": "NODE_ENV=production bun build src/cli/index.tsx --outfile dist/cli.js --target node --format esm --define 'process.env.NODE_ENV=\"production\"' && sed -i 's|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/cli.js && sed -i '2{/^\\/\\/ @bun/d}' dist/cli.js",
+    "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly --declaration --outDir dist",
+    "prepublishOnly": "bun run build",
+    "publish": "npm publish --access public",
+    "cli": "bun run src/cli/index.tsx",
+    "dev": "bun run src/cli/index.tsx --path .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.17",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "ink": "^7.0.6",
+    "react": "^19.2.7",
+    "react-devtools-core": "^7.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LinuxCTRL/spyglass.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LinuxCTRL/spyglass/issues"
+  },
+  "homepage": "https://linuxctrl-docs.vercel.app/docs/spyglass",
+  "keywords": [
+    "dependency-graph",
+    "visualizer",
+    "monorepo",
+    "cli",
+    "circular-dependencies"
+  ]
+}
