@@ -29,7 +29,7 @@
   "scripts": {
     "build": "bun run build:lib && bun run build:cli && bun run build:types",
     "build:lib": "bun build src/index.ts --outfile dist/index.js --target node --format esm && bun build src/index.ts --outfile dist/index.cjs --target node --format cjs",
-    "build:cli": "NODE_ENV=production bun build src/cli/index.tsx --outfile dist/cli.js --target node --format esm --define 'process.env.NODE_ENV=\"production\"' && sed -i 's|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/cli.js && sed -i '2{/^\\/\\/ @bun/d}' dist/cli.js",
+    "build:cli": "bun build src/cli/index.tsx --outfile dist/cli.js --target node --format esm --external @linuxctrl/spyglass && sed -i '1s|.*|#!/usr/bin/env node|' dist/cli.js",
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly --declaration --outDir dist",
     "prepublishOnly": "bun run build",
     "publish": "npm publish --access public",
@@ -40,14 +40,9 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^22.0.0",
-    "@types/react": "^19.2.17",
     "typescript": "^5"
   },
-  "dependencies": {
-    "ink": "^7.0.6",
-    "react": "^19.2.7",
-    "react-devtools-core": "^7.0.1"
-  },
+  "dependencies": {},
   "engines": {
     "node": ">=18.0.0",
     "bun": ">=1.0.0"

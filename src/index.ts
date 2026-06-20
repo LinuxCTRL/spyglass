@@ -1,125 +1,272 @@
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, statSync, readdirSync } from "fs";
 import { join } from "path";
+
+export interface PackageInfo {
+  description?: string;
+  latest?: string;
+  weeklyDownloads?: number;
+  diskSize?: string;
+  outdated: boolean;
+}
 
 export interface GraphNode {
   name: string;
   version: string;
-  path: string;
   depth: number;
-  dependencies: GraphNode[];
+  children: GraphNode[];
+  info?: PackageInfo;
 }
 
 export interface CircularResult {
-  cycle: string[];
-  files: string[];
+  chain: string[];
 }
 
 export interface UnusedResult {
   name: string;
   version: string;
-  from: string;
+  info?: PackageInfo;
 }
 
 export interface WhyResult {
   name: string;
   version: string;
-  resolvedBy: string[];
   path: string[];
+  info?: PackageInfo;
 }
 
 export interface GraphOptions {
   path?: string;
   production?: boolean;
+  npm?: boolean;
 }
 
-export interface ParseResult {
-  graph: GraphNode[];
-  circular: CircularResult[];
-  unused: UnusedResult[];
+export interface GraphSummary {
+  total: number;
+  outdated: number;
+  diskSize: string;
+}
+
+interface NpmCache {
+  [name: string]: { description?: string; latest?: string; weeklyDownloads?: number } | null;
+}
+
+const npmCache: NpmCache = {};
+
+async function fetchNpmInfo(names: string[]): Promise<void> {
+  const uncached = names.filter((n) => !(n in npmCache));
+  if (uncached.length === 0) return;
+
+  const batchSize = 10;
+  for (let i = 0; i < uncached.length; i += batchSize) {
+    const batch = uncached.slice(i, i + batchSize);
+    await Promise.allSettled(
+      batch.map(async (name) => {
+        try {
+          const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/latest`);
+          if (!res.ok) { npmCache[name] = null; return; }
+          const data = await res.json() as Record<string, unknown>;
+          const downloadsRes = await fetch(`https://api.npmjs.org/downloads/point/last-week/${encodeURIComponent(name)}`);
+          let weeklyDownloads: number | undefined;
+          if (downloadsRes.ok) {
+            const dlData = await downloadsRes.json() as Record<string, unknown>;
+            weeklyDownloads = dlData.downloads as number;
+          }
+          npmCache[name] = {
+            description: (data.description as string) || undefined,
+            latest: (data.version as string) || undefined,
+            weeklyDownloads,
+          };
+        } catch {
+          npmCache[name] = null;
+        }
+      }),
+    );
+  }
+}
+
+function getNpmInfo(name: string): { description?: string; latest?: string; weeklyDownloads?: number } | undefined {
+  return npmCache[name] ?? undefined;
+}
+
+function getDiskSize(dir: string): string {
+  try {
+    if (!existsSync(dir)) return "";
+    let total = 0;
+    function walk(d: string) {
+      try {
+        const entries = readdirSync(d);
+        for (const entry of entries) {
+          const full = join(d, entry);
+          try {
+            const stat = statSync(full);
+            if (stat.isDirectory()) walk(full);
+            else total += stat.size;
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+    walk(dir);
+    return formatBytes(total);
+  } catch {
+    return "";
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log10(bytes) / 3), units.length - 1);
+  const val = bytes / Math.pow(1024, i);
+  return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function readPackageJson(dir: string): Record<string, unknown> | null {
   try {
     const filePath = join(dir, "package.json");
     if (!existsSync(filePath)) return null;
-    const content = readFileSync(filePath, "utf-8");
-    return JSON.parse(content);
+    return JSON.parse(readFileSync(filePath, "utf-8"));
   } catch {
     return null;
   }
 }
 
-function getDeps(pkg: Record<string, unknown>, production: boolean): Record<string, string> {
-  const deps = { ...(pkg.dependencies as Record<string, string> || {}) };
-  if (!production) {
-    Object.assign(deps, pkg.devDependencies as Record<string, string> || {});
-  }
-  return deps;
+function getDeps(pkg: Record<string, unknown>): Record<string, string> {
+  return { ...(pkg.dependencies as Record<string, string> || {}) };
 }
 
-export async function parseGraph(options: GraphOptions = {}): Promise<ParseResult> {
+export async function parseGraph(options: GraphOptions = {}): Promise<{
+  tree: GraphNode[];
+  circular: CircularResult[];
+  unused: UnusedResult[];
+  summary: GraphSummary;
+}> {
   const rootDir = options.path ?? process.cwd();
-  const production = options.production ?? false;
   const pkg = readPackageJson(rootDir);
-  if (!pkg) {
-    throw new Error(`No package.json found in ${rootDir}`);
+  if (!pkg) throw new Error(`No package.json found in ${rootDir}`);
+
+  const rootDeps: Record<string, string> = {
+    ...(pkg.dependencies as Record<string, string> || {}),
+  };
+  if (!options.production) {
+    Object.assign(rootDeps, pkg.devDependencies as Record<string, string> || {});
   }
 
-  const deps = getDeps(pkg, production);
-  const visited = new Set<string>();
-  const stack = new Set<string>();
-  const circular: CircularResult[] = [];
-  const allDeps = new Set(Object.keys(deps));
+  // Fetch npm info for all root deps
+  if (options.npm !== false) {
+    await fetchNpmInfo(Object.keys(rootDeps));
+  }
 
-  async function buildNode(name: string, depth: number): Promise<GraphNode | null> {
-    if (depth > 10) return null;
-    const key = `${name}@${depth}`;
-    if (stack.has(name)) {
-      circular.push({ cycle: [name], files: [] });
-      return null;
+  const visited = new Set<string>();
+  const depMap = new Map<string, string>();
+
+  function resolveVersion(name: string, fromDir: string): string | null {
+    const key = `${fromDir}:${name}`;
+    if (depMap.has(key)) return depMap.get(key)!;
+    const p = join(fromDir, "node_modules", name, "package.json");
+    if (existsSync(p)) {
+      const pkgData = JSON.parse(readFileSync(p, "utf-8"));
+      const ver = (pkgData.version as string) ?? null;
+      if (ver) depMap.set(key, ver);
+      return ver;
     }
+    const parent = join(fromDir, "..");
+    if (parent !== fromDir) return resolveVersion(name, parent);
+    return null;
+  }
+
+  function buildNode(name: string, fromDir: string, depth: number): GraphNode | null {
+    if (depth > 8) return null;
+    const version = resolveVersion(name, fromDir) ?? "unknown";
+    const key = `${name}@${version}`;
     if (visited.has(key)) return null;
     visited.add(key);
-    stack.add(name);
 
-    const nodePath = join(rootDir, "node_modules", name);
-    const nodePkg = readPackageJson(nodePath);
-    const version = (nodePkg?.version as string) ?? "unknown";
-    const children = nodePkg ? getDeps(nodePkg, production) : {};
-    const dependencies: GraphNode[] = [];
-
-    for (const child of Object.keys(children)) {
-      const childNode = await buildNode(child, depth + 1);
-      if (childNode) dependencies.push(childNode);
+    const pkgDir = join(fromDir, "node_modules", name);
+    const childPkg = readPackageJson(pkgDir);
+    const childDeps = childPkg ? getDeps(childPkg) : {};
+    const children: GraphNode[] = [];
+    for (const child of Object.keys(childDeps)) {
+      const node = buildNode(child, pkgDir, depth + 1);
+      if (node) children.push(node);
     }
 
-    stack.delete(name);
-    return { name, version, path: nodePath, depth, dependencies };
+    const info = getNpmInfo(name);
+    const diskSize = getDiskSize(pkgDir);
+    const outdated = info?.latest ? info.latest !== version : false;
+
+    return {
+      name,
+      version,
+      depth,
+      children,
+      info: info ? { ...info, diskSize: diskSize || undefined, outdated } : undefined,
+    };
   }
 
-  const graph: GraphNode[] = [];
-  for (const dep of Object.keys(deps)) {
-    const node = await buildNode(dep, 0);
-    if (node) graph.push(node);
+  const tree: GraphNode[] = [];
+  const circular: CircularResult[] = [];
+  const seen = new Set<string>();
+
+  for (const dep of Object.keys(rootDeps)) {
+    if (seen.has(dep)) {
+      circular.push({ chain: [dep] });
+      continue;
+    }
+    seen.add(dep);
+    const node = buildNode(dep, rootDir, 0);
+    if (node) tree.push(node);
   }
 
-  const usedInGraph = new Set<string>();
+  const usedNames = new Set<string>();
   function collectNames(nodes: GraphNode[]) {
     for (const n of nodes) {
-      usedInGraph.add(n.name);
-      collectNames(n.dependencies);
+      usedNames.add(n.name);
+      collectNames(n.children);
     }
   }
-  collectNames(graph);
+  collectNames(tree);
 
   const unused: UnusedResult[] = [];
-  for (const dep of allDeps) {
-    if (!usedInGraph.has(dep)) {
-      unused.push({ name: dep, from: rootDir, version: deps[dep] ?? "unknown" });
+  for (const [name, version] of Object.entries(rootDeps)) {
+    if (!usedNames.has(name)) {
+      unused.push({ name, version, info: npmInfoToPackageInfo(getNpmInfo(name)) });
     }
   }
 
-  return { graph, circular, unused };
+  function findCycles(nodes: GraphNode[], ancestors: string[]) {
+    for (const n of nodes) {
+      if (ancestors.includes(n.name)) {
+        const idx = ancestors.indexOf(n.name);
+        circular.push({ chain: [...ancestors.slice(idx), n.name] });
+      } else {
+        findCycles(n.children, [...ancestors, n.name]);
+      }
+    }
+  }
+  findCycles(tree, []);
+
+  // Summary
+  let total = 0;
+  let outdatedCount = 0;
+  function countNodes(nodes: GraphNode[]) {
+    for (const n of nodes) {
+      total++;
+      if (n.info?.outdated) outdatedCount++;
+      countNodes(n.children);
+    }
+  }
+  countNodes(tree);
+
+  // Total disk size (sum of all packages in node_modules)
+  const nodeModulesDir = join(rootDir, "node_modules");
+  const diskSize = getDiskSize(nodeModulesDir);
+
+  return {
+    tree,
+    circular,
+    unused,
+    summary: { total, outdated: outdatedCount, diskSize },
+  };
 }
 
 export async function findCircular(options: GraphOptions = {}): Promise<CircularResult[]> {
@@ -135,30 +282,36 @@ export async function findUnused(options: GraphOptions = {}): Promise<UnusedResu
 export async function why(name: string, options: GraphOptions = {}): Promise<WhyResult | null> {
   const result = await parseGraph(options);
 
-  function findPath(
-    nodes: GraphNode[],
-    target: string,
-    path: string[],
-  ): string[] | null {
+  function findNode(nodes: GraphNode[], target: string, path: string[]): { node: GraphNode; path: string[] } | null {
     for (const n of nodes) {
-      if (n.name === target) return [...path, n.name];
-      const found = findPath(n.dependencies, target, [...path, n.name]);
+      if (n.name === target) return { node: n, path: [...path, n.name] };
+      const found = findNode(n.children, target, [...path, n.name]);
       if (found) return found;
     }
     return null;
   }
 
-  for (const root of result.graph) {
-    const p = findPath(root.dependencies, name, [root.name]);
-    if (p) {
-      return { name, version: "unknown", resolvedBy: p.slice(0, -1), path: p };
+  for (const root of result.tree) {
+    const found = findNode(root.children, name, [root.name]);
+    if (found) {
+      return {
+        name,
+        version: found.node.version,
+        path: found.path,
+        info: found.node.info ?? npmInfoToPackageInfo(getNpmInfo(name)),
+      };
     }
   }
 
-  const direct = result.graph.find((n) => n.name === name);
-  if (direct) {
-    return { name, version: direct.version, resolvedBy: [], path: [name] };
-  }
+  const direct = result.tree.find((n) => n.name === name);
+  if (direct) return { name, version: direct.version, path: [name], info: direct.info };
 
   return null;
 }
+
+function npmInfoToPackageInfo(info: ReturnType<typeof getNpmInfo>): PackageInfo | undefined {
+  if (!info) return undefined;
+  return { ...info, diskSize: undefined, outdated: false };
+}
+
+export { getNpmInfo, npmInfoToPackageInfo };
